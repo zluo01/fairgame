@@ -1,36 +1,61 @@
+#      FairGame - Automated Purchasing Program
+#      Copyright (C) 2021  Hari Nagarajan
+#
+#      This program is free software: you can redistribute it and/or modify
+#      it under the terms of the GNU General Public License as published by
+#      the Free Software Foundation, either version 3 of the License, or
+#      (at your option) any later version.
+#
+#      This program is distributed in the hope that it will be useful,
+#      but WITHOUT ANY WARRANTY; without even the implied warranty of
+#      MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#      GNU General Public License for more details.
+#
+#      You should have received a copy of the GNU General Public License
+#      along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+#      The author may be contacted through the project's GitHub, at:
+#      https://github.com/Hari-Nagarajan/fairgame
+
+import os
+import platform
+import shutil
+import time
+import traceback
 from datetime import datetime
 from functools import wraps
-from signal import signal, SIGINT
+from pathlib import Path
+from signal import SIGINT, signal
 
-try:
-    import click
-except ModuleNotFoundError:
-    print(
-        "You should try running pipenv shell and pipenv install per the install instructions"
-    )
-    print("Or you should only use Python 3.8.X per the instructions.")
-    print("If you are attempting to run multiple bots, this is not supported.")
-    print("You are on your own to figure this out.")
-    exit(0)
-import time
+import click
 
+from common.globalconfig import AMAZON_CREDENTIAL_FILE, GlobalConfig
 from notifications.notifications import NotificationHandler, TIME_FORMAT
 from stores.amazon import Amazon
-from stores.bestbuy import BestBuyHandler
-from utils import selenium_utils
 from utils.logger import log
-from utils.version import check_version
+from utils.version import is_latest, version, get_latest_version
 
-notification_handler = NotificationHandler()
-
-try:
-    check_version()
-except Exception as e:
-    log.error(e)
+LICENSE_PATH = os.path.join(
+    "cli",
+    "license",
+)
 
 
-def handler(signal, frame):
-    log.info("Caught the stop, exiting.")
+def get_folder_size(folder):
+    return sizeof_fmt(sum(file.stat().st_size for file in Path(folder).rglob("*")))
+
+
+def sizeof_fmt(num, suffix="B"):
+    for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
+        if abs(num) < 1024.0:
+            return "%3.1f%s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.1f%s%s" % (num, "Yi", suffix)
+
+
+# see https://docs.python.org/3/library/signal.html
+def interrupt_handler(signal_num, frame):
+    log.info(f"Caught the interrupt signal.  Exiting.")
     exit(0)
 
 
@@ -39,11 +64,13 @@ def notify_on_crash(func):
     def decorator(*args, **kwargs):
         try:
             func(*args, **kwargs)
+
         except KeyboardInterrupt:
             pass
-        except:
+
+        except Exception as e:
+            log.error(traceback.format_exc())
             notification_handler.send_notification(f"FairGame has crashed.")
-            raise
 
     return decorator
 
@@ -82,7 +109,7 @@ def main():
 
 @click.command()
 @click.option("--no-image", is_flag=True, help="Do not load images")
-@click.option("--headless", is_flag=True, help="Unsupported headless mode. GLHF")
+@click.option("--headless", is_flag=True, help="Headless mode.")
 @click.option(
     "--test",
     is_flag=True,
@@ -147,6 +174,30 @@ def main():
     default=False,
     help="Will attempt to click ship to address button. USE AT YOUR OWN RISK!",
 )
+@click.option(
+    "--clean-profile",
+    is_flag=True,
+    default=False,
+    help="Purge the user profile that Fairgame uses for browsing",
+)
+@click.option(
+    "--clean-credentials",
+    is_flag=True,
+    default=False,
+    help="Purge Amazon credentials and prompt for new credentials",
+)
+@click.option(
+    "--alt-checkout",
+    is_flag=True,
+    default=False,
+    help="Use old add to cart method. Not preferred",
+)
+@click.option(
+    "--captcha-wait",
+    is_flag=True,
+    default=False,
+    help="Wait if captcha could not be solved. Only occurs if enters captcha handler during checkout.",
+)
 @notify_on_crash
 def amazon(
     no_image,
@@ -164,11 +215,26 @@ def amazon(
     p,
     log_stock_check,
     shipping_bypass,
+    clean_profile,
+    clean_credentials,
+    alt_checkout,
+    captcha_wait,
 ):
-
     notification_handler.sound_enabled = not disable_sound
     if not notification_handler.sound_enabled:
         log.info("Local sounds have been disabled.")
+
+    if clean_profile and os.path.exists(global_config.get_browser_profile_path()):
+        log.info(
+            f"Removing existing profile at '{global_config.get_browser_profile_path()}'"
+        )
+        profile_size = get_folder_size(global_config.get_browser_profile_path())
+        shutil.rmtree(global_config.get_browser_profile_path())
+        log.info(f"Freed {profile_size}")
+
+    if clean_credentials and os.path.exists(AMAZON_CREDENTIAL_FILE):
+        log.info(f"Removing existing Amazon credentials from {AMAZON_CREDENTIAL_FILE}")
+        os.remove(AMAZON_CREDENTIAL_FILE)
 
     amzn_obj = Amazon(
         headless=headless,
@@ -180,10 +246,12 @@ def amazon(
         no_screenshots=no_screenshots,
         disable_presence=disable_presence,
         slow_mode=slow_mode,
-        encryption_pass=p,
         no_image=no_image,
+        encryption_pass=p,
         log_stock_check=log_stock_check,
         shipping_bypass=shipping_bypass,
+        alt_checkout=True,
+        wait_on_captcha_fail=captcha_wait,
     )
     try:
         amzn_obj.run(delay=delay, test=test)
@@ -191,17 +259,6 @@ def amazon(
         del amzn_obj
         log.error("Exiting Program...")
         time.sleep(5)
-
-
-@click.command()
-@click.option("--sku", type=str, required=True)
-@click.option("--headless", is_flag=True)
-@notify_on_crash
-def bestbuy(sku, headless):
-    bb = BestBuyHandler(
-        sku, notification_handler=notification_handler, headless=headless
-    )
-    bb.run_item()
 
 
 @click.option(
@@ -234,8 +291,143 @@ def test_notifications(disable_sound):
     time.sleep(5)
 
 
-signal(SIGINT, handler)
+@click.command()
+@click.option("--w", is_flag=True)
+@click.option("--c", is_flag=True)
+def show(w, c):
+    show_file = "show_c.txt"
+    if w and c:
+        print("Choose one option. Program Quitting")
+        exit(0)
+    elif w:
+        show_file = "show_w.txt"
+    elif c:
+        show_file = "show_c.txt"
+    else:
+        print(
+            "Option missing, you must include w or c with show argument. Program Quitting"
+        )
+        exit(0)
+
+    if os.path.exists(LICENSE_PATH):
+
+        with open(os.path.join(LICENSE_PATH, show_file)) as file:
+            try:
+                print(file.read())
+            except FileNotFoundError:
+                log.error("License File Missing. Quitting Program")
+                exit(0)
+    else:
+        log.error("License File Missing. Quitting Program.")
+        exit(0)
+
+
+@click.command()
+@click.option(
+    "--domain",
+    help="Specify the domain you want to find endpoints for (e.g. www.amazon.de, www.amazon.com, smile.amazon.com.",
+)
+def find_endpoints(domain):
+    import dns.resolver
+
+    if not domain:
+        log.error("You must specify a domain to resolve for endpoints with --domain.")
+        exit(0)
+    log.info(f"Attempting to resolve '{domain}'")
+    # Default
+    my_resolver = dns.resolver.Resolver()
+    try:
+        resolved = my_resolver.resolve(domain)
+        for rdata in resolved:
+            log.info(f"Your computer resolves {domain} to {rdata.address}")
+    except Exception as e:
+        log.error(f"Failed to use local resolver due to: {e}")
+        exit(1)
+
+    # Find endpoints from various DNS servers
+    endpoints, resolutions = resolve_domain(domain)
+    log.info(
+        f"{domain} resolves to at least {len(endpoints)} distinct IP addresses across {resolutions} lookups:"
+    )
+    endpoints = sorted(endpoints)
+    for endpoint in endpoints:
+        log.info(f" {endpoint}")
+
+    return endpoints
+
+
+def resolve_domain(domain):
+    import dns.resolver
+
+    public_dns_servers = global_config.get_fairgame_config().get("public_dns_servers")
+    resolutions = 0
+    endpoints = set()
+
+    # Resolve the domain for each DNS server to find out how many end points we have
+    for provider in public_dns_servers:
+        # Provider is Google, Verisign, etc.
+        log.info(f"Testing {provider}")
+        for server in public_dns_servers[provider]:
+            # Server is 8.8.8.8 or 1.1.1.1
+            my_resolver = dns.resolver.Resolver()
+            my_resolver.nameservers = [server]
+
+            try:
+                resolved = my_resolver.resolve(domain)
+            except Exception as e:
+                log.warning(
+                    f"Unable to resolve using {provider} server {server} due to: {e}"
+                )
+                continue
+            for rdata in resolved:
+                ipv4_address = rdata.address
+                endpoints.add(ipv4_address)
+                resolutions += 1
+                log.debug(f"{domain} resolves to {ipv4_address} via {server}")
+    return endpoints, resolutions
+
+
+@click.command()
+@click.option(
+    "--domain", help="Specify the domain you want to generate traceroute commands for."
+)
+def show_traceroutes(domain):
+    if not domain:
+        log.error("You must specify a domain to test routes using --domain.")
+        exit(0)
+
+    # Get the endpoints to test
+    endpoints, resolutions = resolve_domain(domain=domain)
+
+    if platform.system() == "Windows":
+        trace_command = "tracert -d "
+    else:
+        trace_command = "traceroute -n "
+
+    # Spitball test routes via Python's traceroute
+    for endpoint in endpoints:
+        log.info(f" {trace_command}{endpoint}")
+
+
+# Register Signal Handler for Interrupt
+signal(SIGINT, interrupt_handler)
 
 main.add_command(amazon)
-main.add_command(bestbuy)
 main.add_command(test_notifications)
+main.add_command(show)
+main.add_command(find_endpoints)
+main.add_command(show_traceroutes)
+
+# Global scope stuff here
+if is_latest():
+    log.info(f"FairGame v{version}")
+elif version.is_prerelease:
+    log.warning(f"FairGame PRE-RELEASE v{version}")
+else:
+    log.warning(
+        f"You are running FairGame v{version}, but the most recent version is v{get_latest_version()}. "
+        f"Consider upgrading "
+    )
+
+global_config = GlobalConfig()
+notification_handler = NotificationHandler()
